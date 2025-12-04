@@ -25,21 +25,31 @@ Usage (from repo root):
         --num 10 \\
         --gl us \\
         --hl en \\
-        --topic Technology \\
+        --topic-token Technology \\
         --outfile news_ai_data.csv
+
+To debug raw SERP structure, you can additionally pass:
+
+    --raw-outfile data/raw_serp.json
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from dotenv import load_dotenv
 
-from thordata import ThordataClient
+from thordata import (
+    ThordataClient,
+    ThordataAPIError,
+    ThordataAuthError,
+    ThordataRateLimitError,
+)
 
 # -------------------------------------------------------------
 # Env & client
@@ -148,6 +158,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional CSV file to save results (e.g. news_results.csv).",
     )
+    parser.add_argument(
+        "--raw-outfile",
+        type=str,
+        default=None,
+        help="Optional JSON file to dump raw SERP response for debugging.",
+    )
 
     return parser.parse_args()
 
@@ -167,10 +183,13 @@ def search_google_news(
     section_token: Optional[str] = None,
     story_token: Optional[str] = None,
     so: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Call Thordata SERP API with engine=google_news and the parameters
     defined in the official documentation.
+
+    Returns:
+        (articles, raw_results)
     """
     # Build kwargs according to docs
     kwargs: Dict[str, Any] = {}
@@ -194,24 +213,23 @@ def search_google_news(
     if kwargs:
         print("Parameters:", {k: v for k, v in kwargs.items() if v is not None})
 
-    # 按官方示例使用 engine=google_news
-    results = client.serp_search(
+    results: Dict[str, Any] = client.serp_search(
         query=query,
-        engine="google_news",
+        engine="google_news",  # per official docs
         num=num,
         **kwargs,
     )
 
-    # 如果有 code 字段且不是 200，优先报错
+    # If the backend uses an application-level "code" field, check it first.
     if isinstance(results, dict) and results.get("code") and results.get("code") != 200:
         raise RuntimeError(
             f"SERP API error: code={results.get('code')} msg={results.get('msg')}"
         )
 
-    # 1. 优先使用 'news' 字段（你返回里就是这个）
+    # 1. Prefer 'news' field if present (Thordata's google_news structure)
     raw_list = results.get("news")
 
-    # 2. 若 'news' 为空，再尝试 'news_results' / 'organic' / 'data'
+    # 2. Fallback to other common keys if 'news' is missing/empty
     if not isinstance(raw_list, list) or not raw_list:
         for key in ("news_results", "organic", "data"):
             value = results.get(key)
@@ -230,13 +248,12 @@ def search_google_news(
                 "title": item.get("title"),
                 "link": item.get("link"),
                 "source": item.get("source") or item.get("news_source"),
-
                 "date": item.get("date") or item.get("published_time"),
             }
         )
 
     print(f"Received {len(articles)} results.")
-    return articles
+    return articles, results
 
 
 # -------------------------------------------------------------
@@ -247,31 +264,62 @@ def main() -> None:
     args = parse_args()
     client = build_client()
 
-    articles = search_google_news(
-        client=client,
-        query=args.query,
-        num=args.num,
-        gl=args.gl,
-        hl=args.hl,
-        topic_token=args.topic_token,
-        publication_token=args.publication_token,
-        section_token=args.section_token,
-        story_token=args.story_token,
-        so=args.so,
-    )
+    try:
+        articles, raw_results = search_google_news(
+            client=client,
+            query=args.query,
+            num=args.num,
+            gl=args.gl,
+            hl=args.hl,
+            topic_token=args.topic_token,
+            publication_token=args.publication_token,
+            section_token=args.section_token,
+            story_token=args.story_token,
+            so=args.so,
+        )
+    except ThordataRateLimitError as e:
+        print(
+            "Thordata SERP API rate/quota issue (402/429). "
+            "Please check your Thordata plan/balance:"
+        )
+        print(f"  {e}")
+        return
+    except ThordataAuthError as e:
+        print("Thordata SERP API authentication/authorization error:")
+        print(f"  {e}")
+        return
+    except ThordataAPIError as e:
+        print("Thordata SERP API returned an error:")
+        print(f"  {e}")
+        return
+    except RuntimeError as e:
+        # Application-level 'code' errors handled inside search_google_news
+        print(f"Error while calling SERP API: {e}")
+        return
 
     if not articles:
-        print("No news results found.")
+        print("No news results found for this query.")
+        print("Try a broader query or adjust gl/hl/topic_token parameters.")
         return
 
     df = pd.DataFrame(articles)
     print("\nTop results:")
     print(df.head(10).to_string(index=False))
 
+    # Save structured CSV if requested
     if args.outfile:
         out_path = Path(args.outfile).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(out_path, index=False, encoding="utf-8")
         print(f"\nSaved {len(df)} results to {out_path}")
+
+    # Optionally dump raw SERP JSON for debugging
+    if args.raw_outfile:
+        raw_path = Path(args.raw_outfile).resolve()
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        with raw_path.open("w", encoding="utf-8") as f:
+            json.dump(raw_results, f, ensure_ascii=False, indent=2)
+        print(f"Saved raw SERP JSON to {raw_path}")
 
 
 if __name__ == "__main__":
